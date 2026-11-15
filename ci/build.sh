@@ -105,7 +105,11 @@ echo "--- make -j$JOBS ---"
 make -j"$JOBS" > "$WORK/make-$NGINX.log" 2>&1 ||
 	{ tail -40 "$WORK/make-$NGINX.log"; exit 1; }
 
-if grep -E "ngx_http_mogilefs_module\.c.*warning" "$WORK/make-$NGINX.log"; then
+# Anchored on this repository's own source directory, so every file the
+# module brings is covered and nginx's own are not.  Matching on one
+# file name instead would leave the rest of a multi-file module
+# unchecked.
+if grep -E "^$SRC/src/.*warning" "$WORK/make-$NGINX.log"; then
 	echo "ci/build.sh: the compiler warned about this module, see above" >&2
 	exit 1
 fi

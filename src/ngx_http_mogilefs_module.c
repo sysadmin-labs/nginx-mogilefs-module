@@ -65,6 +65,7 @@ typedef struct {
 } ngx_http_mogilefs_aux_param_t;
 
 typedef struct {
+    ngx_http_request_t       *request;
     ngx_http_mogilefs_cmd_t  *cmd;
     ngx_array_t               sources; 
     ssize_t                   num_paths_returned;
@@ -316,9 +317,6 @@ ngx_http_mogilefs_handler(ngx_http_request_t *r)
 
     u->peer.log = r->connection->log;
     u->peer.log_error = NGX_ERROR_ERR;
-#if (NGX_THREADS)
-    u->peer.lock = &r->connection->lock;
-#endif
 
     u->output.tag = (ngx_buf_tag_t) &ngx_http_mogilefs_module;
 
@@ -356,6 +354,13 @@ ngx_http_mogilefs_handler(ngx_http_request_t *r)
         ngx_http_set_ctx(r, ctx, ngx_http_mogilefs_module);
     }
 
+    /*
+     * Outside the branch above: a context created for the main request is
+     * found again here by a subrequest, and the filter needs the request
+     * that is running now, not the one it was created for.
+     */
+    ctx->request = r;
+
     u->input_filter_init = ngx_http_mogilefs_filter_init;
     u->input_filter = ngx_http_mogilefs_filter;
     u->input_filter_ctx = ctx;
@@ -370,9 +375,12 @@ ngx_http_mogilefs_handler(ngx_http_request_t *r)
         return NGX_ERROR;
     }
 
-#if defined nginx_version && nginx_version >= 8011
+    /*
+     * Held open for the tracker request.  The version guard that used to
+     * sit here asked for nginx 0.8.11 or newer, which every release this
+     * builds against has been for fifteen years.
+     */
     r->main->count++;
-#endif
 
     ngx_http_upstream_init(r);
 
@@ -481,19 +489,24 @@ ngx_http_mogilefs_put_handler(ngx_http_request_t *r)
             ctx->state = FETCH;
             break;
         case FETCH:
-#if defined nginx_version && nginx_version >= 8011
+            /*
+             * Each of these starts a subrequest that outlives the call,
+             * so the main request has to be held open for it.  Exactly
+             * once per step: the last commit the original author made,
+             * the merge 020937f, took the increment from both of its
+             * parents and left two of them here.  The count then never
+             * came back down and a PUT hung for good -- create_open went
+             * out, create_close never did.  The 1.0.4 tarball has the
+             * opposite problem, no increment at all, because both
+             * parents came after the tag.
+             */
             r->main->count++;
-#endif
+
             spare_location = mgcf->create_close_spare_location;
             ctx->state = CREATE_CLOSE;
-#if defined nginx_version && nginx_version >= 8011
-            r->main->count++;
-#endif
             break;
         case CREATE_CLOSE:
-#if defined nginx_version && nginx_version >= 8011
             r->main->count++;
-#endif
             r->headers_out.content_length_n = 0;
             r->headers_out.status = NGX_HTTP_CREATED;
 
@@ -904,7 +917,7 @@ static ngx_int_t
 ngx_http_mogilefs_process_ok_response(ngx_http_request_t *r,
     ngx_http_upstream_t *u, ngx_str_t *line)
 {
-    u_char                          *p;
+    u_char                          *p, *end;
     ngx_str_t                        param;
     ngx_int_t                        rc;
 
@@ -919,6 +932,13 @@ ngx_http_mogilefs_process_ok_response(ngx_http_request_t *r,
 
     line->data += sizeof("OK ") - 1;
     line->len -= sizeof("OK ") - 1;
+
+    /*
+     * Where the tracker's line ends, so that the buffer can be moved past
+     * it below.  line->len stops before the LF, and shifting data and len
+     * by the same amount above leaves their sum where it was.
+     */
+    end = line->data + line->len + 1;
 
     p = line->data;
 
@@ -959,11 +979,11 @@ ngx_http_mogilefs_process_ok_response(ngx_http_request_t *r,
      */
     if(ctx->cmd->method & NGX_HTTP_DELETE) {
         r->headers_out.content_length_n = 0;
+        u->headers_in.content_length_n = 0;
         u->headers_in.status_n = NGX_HTTP_NO_CONTENT;
         u->state->status = NGX_HTTP_NO_CONTENT;
 
-        // Return no content
-        u->buffer.pos = u->buffer.pos;
+        u->buffer.pos = end;
 
         return NGX_OK;
     }
@@ -974,11 +994,11 @@ ngx_http_mogilefs_process_ok_response(ngx_http_request_t *r,
     if((ctx->num_paths_returned <= 0 && (!(ctx->cmd->method & NGX_HTTP_PUT))) || ctx->sources.nelts == 0)
     {
         r->headers_out.content_length_n = 0;
+        u->headers_in.content_length_n = 0;
         u->headers_in.status_n = NGX_HTTP_SERVICE_UNAVAILABLE;
         u->state->status = NGX_HTTP_SERVICE_UNAVAILABLE;
 
-        // Return no content
-        u->buffer.pos = u->buffer.pos;
+        u->buffer.pos = end;
 
         return NGX_OK;
     }
@@ -1054,12 +1074,17 @@ ngx_http_mogilefs_process_ok_response(ngx_http_request_t *r,
         }
     }
 
+    /*
+     * The tracker's answer is one line and all of it has been read, so
+     * say so here too.  As in the error path above, input_filter_init is
+     * what actually bounds the read; this keeps the structure honest.
+     */
     r->headers_out.content_length_n = 0;
+    u->headers_in.content_length_n = 0;
     u->headers_in.status_n = 200;
     u->state->status = 200;
 
-    // Return no content
-    u->buffer.pos = u->buffer.pos;
+    u->buffer.pos = end;
 
     return NGX_OK;
 }
@@ -1068,6 +1093,7 @@ static ngx_int_t
 ngx_http_mogilefs_process_error_response(ngx_http_request_t *r,
     ngx_http_upstream_t *u, ngx_str_t *line)
 {
+    u_char                    *end;
     ngx_http_mogilefs_error_t *e;
     ngx_http_mogilefs_ctx_t   *ctx;
 
@@ -1092,26 +1118,43 @@ ngx_http_mogilefs_process_error_response(ngx_http_request_t *r,
     ctx = ngx_http_get_module_ctx(r, ngx_http_mogilefs_module);
 
     /*
+     * There is no body, so say so on the upstream structure as well as on
+     * the outgoing headers, and move the buffer past the line that was
+     * just read -- "pos = pos", which is what stood here, is a no-op.
+     *
+     * Neither is what stops nginx reading on; input_filter_init does
+     * that, by setting u->length, and with it in place taking these two
+     * lines away again changes no measured behaviour.  They are here
+     * because they are what the structure means and because
+     * ngx_http_memcached_module.c, which is this module's model, sets
+     * both: a later change to the filter should not be able to revive
+     * the sixty-second wait on its own.
+     */
+    end = line->data + line->len + 1;   /* line->len stops before the LF */
+
+    /*
      * Convert unknown_key response to delete into No content
      */
     if(ctx->cmd->method & NGX_HTTP_DELETE && e->delete_ok) {
         r->headers_out.content_length_n = 0;
+        u->headers_in.content_length_n = 0;
         u->headers_in.status_n = NGX_HTTP_NO_CONTENT;
         u->state->status = NGX_HTTP_NO_CONTENT;
 
-        // Return no content
-        u->buffer.pos = u->buffer.pos;
+        u->buffer.pos = end;
+        u->keepalive = 1;
 
         return NGX_OK;
     }
 
     r->headers_out.content_length_n = 0;
+    u->headers_in.content_length_n = 0;
     u->headers_in.status_n = e->status;
     u->state->status = e->status;
     ctx->status = e->status;
 
-    // Return no content
-    u->buffer.pos = u->buffer.pos;
+    u->buffer.pos = end;
+    u->keepalive = 1;
 
     return NGX_OK;
 }
@@ -1283,6 +1326,29 @@ ngx_http_mogilefs_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
 static ngx_int_t
 ngx_http_mogilefs_filter_init(void *data)
 {
+    ngx_http_mogilefs_ctx_t *ctx = data;
+
+    ngx_http_upstream_t     *u;
+
+    u = ctx->request->upstream;
+
+    /*
+     * A tracker answers in one line, and process_header has already read
+     * all of it, so there is no body to wait for.
+     *
+     * nginx sets u->length to -1 just before it calls this and leaves it
+     * to the module to say what is still to come; this used to return
+     * without touching it, so nginx went on reading from the tracker
+     * until end of file or mogilefs_read_timeout.  On a GET nothing came
+     * of it, because the X-Accel-Redirect sends the request elsewhere
+     * anyway.  A PUT stopped dead: create_open was answered, the module
+     * then sat in the timeout, and create_close was never sent -- the
+     * file reached the storage node and the tracker never heard that it
+     * had, which leaves it unreachable and, as far as MogileFS is
+     * concerned, nonexistent.
+     */
+    u->length = 0;
+
     return NGX_OK;
 }
 
@@ -1538,7 +1604,7 @@ ngx_http_mogilefs_create_spare_location(ngx_conf_t *cf, ngx_http_conf_ctx_t **oc
     ngx_uint_t                 i;
     ngx_http_module_t         *module;
     void                      *mconf;
-    ngx_http_core_loc_conf_t  *clcf, *pclcf, *rclcf;
+    ngx_http_core_loc_conf_t  *clcf, *rclcf;
     ngx_http_core_srv_conf_t  *cscf;
 
     ctx = ngx_pcalloc(cf->pool, sizeof(ngx_http_conf_ctx_t));
@@ -1555,6 +1621,31 @@ ngx_http_mogilefs_create_spare_location(ngx_conf_t *cf, ngx_http_conf_ctx_t **oc
         return NGX_CONF_ERROR;
     }
 
+    /*
+     * The module list has to come from the cycle, not from the ngx_modules
+     * array: a dynamically loaded module is not in that array, so walking
+     * it leaves every dynamic module's slot in ctx->loc_conf empty.  This
+     * module's own slot is one of them whenever it is loaded with
+     * load_module, and the next line but one dereferences it.
+     */
+#if (nginx_version >= 1009011)
+    for (i = 0; cf->cycle->modules[i]; i++) {
+        if (cf->cycle->modules[i]->type != NGX_HTTP_MODULE) {
+            continue;
+        }
+
+        module = cf->cycle->modules[i]->ctx;
+
+        if (module->create_loc_conf) {
+
+            mconf = module->create_loc_conf(cf);
+            if (mconf == NULL) {
+                 return NGX_CONF_ERROR;
+            }
+
+            ctx->loc_conf[cf->cycle->modules[i]->ctx_index] = mconf;
+        }
+#else
     for (i = 0; ngx_modules[i]; i++) {
         if (ngx_modules[i]->type != NGX_HTTP_MODULE) {
             continue;
@@ -1571,9 +1662,8 @@ ngx_http_mogilefs_create_spare_location(ngx_conf_t *cf, ngx_http_conf_ctx_t **oc
 
             ctx->loc_conf[ngx_modules[i]->ctx_index] = mconf;
         }
+#endif
     }
-
-    pclcf = pctx->loc_conf[ngx_http_core_module.ctx_index];
 
     clcf = ctx->loc_conf[ngx_http_core_module.ctx_index];
 

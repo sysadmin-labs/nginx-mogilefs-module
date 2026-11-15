@@ -1,0 +1,58 @@
+name: Function
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '7 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    name: pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      nginx: ${{ steps.read.outputs.nginx }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: read
+        run: .github/scripts/pins.sh >> "$GITHUB_OUTPUT"
+
+  mogtest:
+    name: nginx ${{ matrix.nginx }}
+    needs: pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        nginx: ${{ fromJSON(needs.pins.outputs.nginx) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Test::Nginx is not needed here, this suite drives nginx itself.
+      - uses: ./.github/actions/setup
+        with:
+          test-nginx: 'false'
+
+      - name: Read, fail over, write, delete
+        run: ci/mogtest.sh '${{ matrix.nginx }}'
+
+      - name: What the tracker saw
+        if: failure()
+        run: |
+          echo '--- tracker ---'
+          tail -60 ci-work/tracker.log 2>/dev/null || true
+          echo '--- error log ---'
+          tail -80 "ci-work/mog-${{ matrix.nginx }}/logs/error.log" 2>/dev/null || true

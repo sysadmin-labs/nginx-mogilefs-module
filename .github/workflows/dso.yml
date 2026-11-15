@@ -1,0 +1,50 @@
+name: Dynamic load
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: '7 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    name: pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      nginx: ${{ steps.read.outputs.nginx }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: read
+        run: .github/scripts/pins.sh >> "$GITHUB_OUTPUT"
+
+  dso:
+    name: nginx ${{ matrix.nginx }}
+    needs: pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Every release, not just the one the ports ship.  This is the case
+    # that was broken for fifteen years and the one the FreeBSD port
+    # builds, so it is worth the full matrix.
+    strategy:
+      fail-fast: false
+      matrix:
+        nginx: ${{ fromJSON(needs.pins.outputs.nginx) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          test-nginx: 'false'
+
+      - name: Load the module with load_module and read a configuration
+        run: ci/dso.sh '${{ matrix.nginx }}'

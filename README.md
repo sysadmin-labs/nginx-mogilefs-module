@@ -34,44 +34,6 @@ and hands the answer to `proxy_pass`, so nginx serves the file straight
 from the storage node that has it. Writing and deleting through the
 tracker work as well.
 
-## Where this comes from
-
-Valery Kholodkov wrote this module and released 1.0.4 in 2011. The
-download page it was published on, `www.grid.net.ru`, no longer answers at
-all, and the author's repository has had no commit since October 2012.
-This repository continues it, with the original history intact: every
-commit up to `020937f` is his.
-
-Starting from his last commit rather than from the 1.0.4 tarball showed
-that both are broken, in different ways. Three faults, each with a gate
-in continuous integration that goes red if it is put back:
-
-- **It crashed when loaded with `load_module`.** The hidden locations
-  behind `mogilefs_pass` were built by walking `ngx_modules`, the array
-  of statically linked modules. A dynamically loaded module is not in it,
-  so its own slot in the location configuration stayed empty and the next
-  dereference took nginx down: `nginx -t` exited on signal 11 without
-  printing a line. Built into the binary the same source is fine, which
-  is why it lasted fifteen years — and why the FreeBSD port, which builds
-  it as a loadable module, has never worked.
-- **A write never finished.** `input_filter_init` returned without
-  setting `u->length`, so nginx kept reading from the tracker after the
-  single line it answers with. `create_open` was answered, the module
-  then sat in `mogilefs_read_timeout`, and `create_close` was never sent:
-  the file reached the storage node and the tracker never heard that it
-  had. The same fault held a worker for a minute after every tracker
-  error other than a 404.
-- **Each write leaked a request.** `020937f`, the author's last commit,
-  is a merge that took the `r->main->count++` from both of its parents,
-  so the write handler raised the count twice per step and it never came
-  back down. Twenty writes left twenty requests and their connections in
-  the worker. The 1.0.4 tarball has the opposite fault — both parents
-  came after the tag, so it has no increment at all and a write is never
-  answered.
-
-Alongside those, `u->peer.lock` and the pre-1.9.11 `config` form are
-gone, which is what downstream patches in FreeBSD had been carrying.
-
 ## Requirements
 
 nginx 1.28 or newer. Older releases are not built against; 1.9.11 is the

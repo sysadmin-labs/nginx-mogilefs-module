@@ -347,7 +347,12 @@ ngx_http_mogilefs_handler(ngx_http_request_t *r)
         ctx->aux_params = NULL;
         ctx->status = 0;
 
-        ngx_array_init(&ctx->sources, r->pool, 1, sizeof(ngx_http_mogilefs_src_t));
+        if (ngx_array_init(&ctx->sources, r->pool, 1,
+                           sizeof(ngx_http_mogilefs_src_t))
+            != NGX_OK)
+        {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
 
         if(ngx_http_mogilefs_eval_key(r, &ctx->key) != NGX_OK) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -519,7 +524,10 @@ ngx_http_mogilefs_put_handler(ngx_http_request_t *r)
 
     uri.len = spare_location.len + ctx->key.len;
 
-    uri.data = ngx_palloc(r->pool, uri.len);
+    uri.data = ngx_pnalloc(r->pool, uri.len);
+    if (uri.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     p = ngx_cpymem(uri.data, spare_location.data, spare_location.len);
 
@@ -947,27 +955,39 @@ ngx_http_mogilefs_process_ok_response(ngx_http_request_t *r,
     param.data = p;
     param.len = 0;
 
-    while (*p != LF) {
+    /*
+     * Bounded by "end", which is where the line the caller handed over
+     * stops: this walks a buffer filled from the network, and it is not
+     * terminated.
+     */
+    while (p < end && *p != LF) {
         if (*p == '&' || *p == CR) {
-            if(param.len != 0) {
+            if (param.len != 0) {
                 rc = ngx_http_mogilefs_parse_param(r, &param);
 
-                if(rc != NGX_OK) {
+                if (rc != NGX_OK) {
                     return rc;
                 }
-
-                p++;
-
-                param.data = p;
-                param.len = 0;
             }
 
-            if(*p == CR) {
+            if (*p == CR) {
                 break;
             }
-            else {
-                continue;
-            }
+
+            /*
+             * Step over the separator in either case.  Stepping only when
+             * the parameter before it was not empty left p where it was
+             * for an empty one, and the loop then spun at that position
+             * with the worker at full CPU and nothing written to the error
+             * log.  Any tracker response with "&&" in it, or with a
+             * leading "&", was enough.
+             */
+            p++;
+
+            param.data = p;
+            param.len = 0;
+
+            continue;
         }
 
         param.len++;
@@ -1144,7 +1164,6 @@ ngx_http_mogilefs_process_error_response(ngx_http_request_t *r,
         u->state->status = NGX_HTTP_NO_CONTENT;
 
         u->buffer.pos = end;
-        u->keepalive = 1;
 
         return NGX_OK;
     }
@@ -1156,7 +1175,6 @@ ngx_http_mogilefs_process_error_response(ngx_http_request_t *r,
     ctx->status = e->status;
 
     u->buffer.pos = end;
-    u->keepalive = 1;
 
     return NGX_OK;
 }
@@ -1201,9 +1219,17 @@ ngx_http_mogilefs_parse_param(ngx_http_request_t *r, ngx_str_t *param) {
     ngx_http_mogilefs_ctx_t   *ctx;
     ngx_http_mogilefs_src_t   *source;
 
-    p = (u_char *) ngx_strchr(param->data, '=');
+    /*
+     * Bounded to the parameter, because param->data points into the
+     * upstream buffer, which carries what the network delivered and is
+     * not terminated.  ngx_strchr searched past the end of the line for
+     * the next '=' or NUL; when it found one, the subtraction below went
+     * negative, became a very large size_t, and ngx_unescape_uri then
+     * decoded over that length back into the same place.
+     */
+    p = ngx_strlchr(param->data, param->data + param->len, '=');
 
-    if(p == NULL) {
+    if (p == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "mogilefs tracker has sent invalid param: \"%V\"", param);
         return NGX_ERROR;

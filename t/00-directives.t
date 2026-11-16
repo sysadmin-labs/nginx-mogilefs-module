@@ -73,7 +73,7 @@ ok
 
 
 
-=== TEST 4: the spare paths are variables of their own
+=== TEST 4: the spare path variables exist to be used
 --- config
     location /download/ {
         mogilefs_tracker 127.0.0.1:7001;
@@ -88,6 +88,8 @@ ok
 GET /t
 --- response_body
 ok
+--- no_error_log
+unknown "mogilefs_path1" variable
 
 
 
@@ -157,7 +159,7 @@ ok
 
 
 
-=== TEST 9: a connect timeout above 75 seconds is refused by nginx
+=== TEST 9: a connect timeout larger than the default is accepted
 --- config
     location /download/ {
         mogilefs_tracker         127.0.0.1:7001;

@@ -45,6 +45,14 @@
 # it starts with "err-" makes the tracker answer with the error code that
 # follows the dash, which is how the tests reach the error paths without
 # needing a broken MogileFS.
+#
+# A key starting with "raw-" answers with a malformed line instead, so that
+# the parser can be asked what it does with one.  A tracker on the far side
+# of a network is not a trusted source of well-formed lines, and two of
+# these shapes used to be enough to take the worker out: "a=1&&b=2" spun
+# the parameter loop at one position for ever, and a parameter with no "="
+# in it sent ngx_strchr past the end of the buffer and then handed a
+# negative length to ngx_unescape_uri.
 
 use strict;
 use warnings;
@@ -110,6 +118,29 @@ sub forced_error {
     return $key =~ /^err-(.+)$/ ? $1 : undef;
 }
 
+# A key of the form raw-<shape> is answered with a line of that shape.  The
+# path is a real one so that a module which copes with the line can still
+# go on and fetch something; what is asserted is that it answers at all.
+sub raw_reply {
+    my ($key, $store) = @_;
+    return undef unless $key =~ /^raw-(.+)$/;
+    my $shape = $1;
+    my $path  = "$store/dev1/0/000/000/0000000001.fid";
+
+    # "&&": an empty parameter between two separators
+    return "OK paths=1&&path1=$path"  if $shape eq 'empty-param';
+    # a leading separator, so the first parameter is the empty one
+    return "OK &paths=1&path1=$path"  if $shape eq 'leading-amp';
+    # a parameter with no "=" at all, and nothing after it
+    return 'OK paths'                 if $shape eq 'no-equals';
+    # a parameter with no "=" followed by a well formed one
+    return "OK paths&path1=$path"     if $shape eq 'no-equals-mid';
+    # only separators
+    return 'OK &&&'                   if $shape eq 'only-amps';
+
+    return "ERR unknown_raw_shape unknown_raw_shape";
+}
+
 while (my $client = $listen->accept) {
     $client->autoflush(1);
 
@@ -123,7 +154,10 @@ while (my $client = $listen->accept) {
 
         my $reply;
 
-        if (my $code = forced_error($a{key} // '')) {
+        if (defined(my $raw = raw_reply($a{key} // '', $store))) {
+            $reply = $raw;
+        }
+        elsif (my $code = forced_error($a{key} // '')) {
             $reply = "ERR $code $code";
         }
         elsif (($a{domain} // '') ne $domain) {

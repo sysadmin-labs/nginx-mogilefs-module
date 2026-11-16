@@ -278,6 +278,33 @@ check "the written key has one copy"     200 -                      "$base/rw/wr
 check "DELETE removes it"                204 -  -X DELETE           "$base/rw/written"
 check "and it is gone"                   404 -                      "$base/rw/written"
 
+# A tracker on the far side of a network is not a trusted source of well
+# formed lines.  t/tracker.pl answers a key starting with "raw-" with a
+# malformed one, and the shapes below are the two that used to be fatal:
+#
+#   "a=1&&b=2" and a leading "&" left an empty parameter between two
+#   separators.  The parameter loop stepped over the separator only when
+#   the parameter before it was not empty, so for an empty one it spun at
+#   that position, at full CPU, for ever, with nothing in the error log.
+#   The ceiling inside check() is what catches it: a spinning worker never
+#   answers, and curl gives up after five seconds.
+#
+#   A parameter with no "=" sent ngx_strchr past the end of the upstream
+#   buffer, which carries what the network delivered and is not
+#   terminated.  Where it found an "=" beyond the line, the length
+#   computed from it went negative, became a very large size_t, and
+#   ngx_unescape_uri then wrote over that length.  A refusal is the right
+#   answer here, and a refusal is what is asserted.
+# Last, deliberately: a worker that spins answers nothing afterwards
+# either, so these in front would have reported every later check as a
+# failure of its own and buried what actually broke.
+echo "--- malformed tracker lines ---"
+check "an empty parameter is stepped over"   200 'contents of key one' "$base/download/raw-empty-param"
+check "a leading separator too"              200 'contents of key one' "$base/download/raw-leading-amp"
+check "a parameter without = is refused"     500 -                     "$base/download/raw-no-equals"
+check "also with a good one behind it"       500 -                     "$base/download/raw-no-equals-mid"
+check "a line of separators has no paths"    503 -                     "$base/download/raw-only-amps"
+
 echo "--- nothing left behind in the worker ---"
 #
 # A reference count raised once too often does not fail a request.  The
@@ -305,21 +332,34 @@ while [ "$i" -lt 20 ]; do
 	i=$((i + 1))
 done
 
+# The malformed lines above go through here as well.  Their checks say
+# the module answers and does not spin; whether a request is left behind
+# on those error paths is a different question, and this is where it can
+# be asked, because the figure is taken after them rather than before.
+i=0
+while [ "$i" -lt 5 ]; do
+	for shape in empty-param leading-amp no-equals no-equals-mid only-amps; do
+		curl -s --max-time 5 -o /dev/null \
+			"$base/download/raw-$shape" 2>/dev/null
+	done
+	i=$((i + 1))
+done
+
 # Give the worker a moment to let go of the keepalive connections curl
 # left behind; without this the figure below counts those instead.
 sleep 1
 after=$(stub)
 
-echo "    open before the writes: $before, after twenty of them: $after"
+echo "    open before: $before, after twenty writes and twenty-five malformed lines: $after"
 
 if [ -z "$before" ] || [ -z "$after" ]; then
 	echo "not ok - could not read stub_status"
 	fail=$((fail + 1))
 elif [ "$after" -gt $((before + 2)) ]; then
-	echo "not ok - twenty writes left $((after - before)) requests open in the worker"
+	echo "not ok - the rounds left $((after - before)) requests open in the worker"
 	fail=$((fail + 1))
 else
-	echo "ok - the writes left nothing open"
+	echo "ok - the writes and the malformed lines left nothing open"
 fi
 
 echo "--- nginx still healthy? ---"

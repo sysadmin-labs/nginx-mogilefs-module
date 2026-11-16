@@ -221,9 +221,11 @@ ci/dso.sh 1.30.6                       # the same module, loaded dynamically
 and the stand-in storage node, then walks the paths that matter: a key
 that exists, one that does not, each error the tracker can return, a key
 stored three times where only the third copy is actually there, and a
-write followed by a read and a delete. It fails on an alert in the error
-log as well, because a worker that was restarted mid-run still answers
-every request.
+write followed by a read and a delete. It also asks the tracker for
+malformed answers, because a tracker across a network is not a trusted
+source of well-formed lines, and counts the requests left open in the
+worker afterwards. It fails on an alert in the error log as well, because
+a worker that was restarted mid-run still answers every request.
 
 ## License
 
